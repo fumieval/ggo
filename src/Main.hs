@@ -15,9 +15,15 @@ import System.Random.MWC.Distributions
 
 data Faction = Red | Green deriving (Eq, Ord, Enum, Bounded)
 
-data Role = Triangle | Circle deriving (Eq, Ord, Enum, Bounded)
+data Role = Eliminator | Therapist | Contestant deriving (Eq, Ord, Enum, Bounded)
 
-data Piece = Piece Faction Role
+data Piece = Piece
+    { _pieceFaction :: !Faction
+    , _pieceRole :: !Role
+    , _pieceHealth :: !Int
+    , _pieceTick :: !Int
+    } deriving Eq
+makeLenses ''Piece
 
 data GameState = GameState
   { _currentFaction :: Faction
@@ -54,7 +60,7 @@ initialState = do
         , (j, q) <- IM.toList $ snd $ IM.split i vs
         , let d = sum $ fmap (notTooClose p q) $ IM.delete i $ IM.delete j vs]
 
-  return $ GameState Red Triangle vs es IM.empty
+  return $ GameState Red Eliminator vs es IM.empty
 
   where
     notTooClose p q o
@@ -80,8 +86,30 @@ factionColor Red = V4 0.9 0.43 0.56 1
 factionColor Green = V4 0.6 0.9 0.56 1
 
 roleShape :: Picture2D p => Role -> p ()
-roleShape Triangle = polygon [V2 (-16) 12, V2 16 12, V2 0 (-12)]
-roleShape Circle = circle 12
+roleShape Eliminator = polygon [V2 (-16) 12, V2 16 12, V2 0 (-12)]
+roleShape Therapist = circle 12
+roleShape Contestant = polygon [V2 (-12) 12, V2 12 12, V2 12 (-12), V2 (-12) (-12)]
+
+roleHealth :: Role -> Int
+roleHealth Eliminator = 3
+roleHealth Therapist = 3
+roleHealth Contestant = 6
+
+roleTicks :: Role -> Int
+roleTicks Eliminator = 300
+roleTicks Therapist = 300
+roleTicks Contestant = 600
+
+activate :: Faction -> Role -> Piece -> Piece
+activate f Eliminator (Piece g r h t) | f /= g = Piece g r (h - 2) t
+activate f Therapist (Piece g r h t) | f == g, h < roleHealth r = Piece g r (h + 1) t
+activate f Contestant (Piece g r h t) | f /= g = Piece g r h (t + 150)
+activate _ _ p = p
+
+isEffective :: Piece -> Piece -> Maybe Faction
+isEffective (Piece f r _ _) p
+  | activate f r p /= p = Just f
+  | otherwise = Nothing
 
 main :: IO (Maybe GameState)
 main = runGame Windowed (Box (V2 0 0) (V2 1600 900)) $ do
@@ -90,6 +118,8 @@ main = runGame Windowed (Box (V2 0 0) (V2 1600 900)) $ do
 
   s0 <- liftIO initialState
 
+  font <- loadFont "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+
   flip execStateT s0 $ forever $ do
 
     whenM (keyDown KeyR) $ liftIO initialState >>= put
@@ -97,9 +127,16 @@ main = runGame Windowed (Box (V2 0 0) (V2 1600 900)) $ do
     vs <- use vertices
     cs <- use edges
 
-    forM_ cs $ \(i, j) -> color gray $ line [vs IM.! i, vs IM.! j]
-
     lv <- use livePieces
+
+    forM_ cs $ \(i, j) -> let l = line [vs IM.! i, vs IM.! j] in case (lv ^? ix i, lv ^? ix j) of
+      (Just p, Just q) -> case (isEffective p q, isEffective q p) of
+        (Just f, Just f') -> thickness 5
+          $ color (if f == f' then factionColor f else gray) $ color gray l
+        (Just f, _) -> thickness 5 $ color (factionColor f) l
+        (_, Just f) -> thickness 5 $ color (factionColor f) l
+        _ -> color gray l
+      _ -> color gray l
 
     whenM mouseDownR $ currentRole %= cycleEnum
     whenM (keyDown KeySpace) $ currentFaction %= cycleEnum
@@ -109,11 +146,28 @@ main = runGame Windowed (Box (V2 0 0) (V2 1600 900)) $ do
     translate p $ color (factionColor faction & _w .~ 0.5) $ roleShape role
     iforM_ vs $ \i v -> do
       translate v $ case lv ^? ix i of
-        Just (Piece f r) -> color (factionColor f) $ roleShape r
+        Just piece | _pieceHealth piece <= 0 -> livePieces . at i .= Nothing
+        Just (Piece f r l t) -> do
+          color (factionColor f) $ roleShape r
+          translate (V2 12 (-6)) $ color black $ text font 12 $ show l
+          color (factionColor f
+            & _w .~ if t < 90 then (if even $ t `div` 3 then 1 else 0) else 0.7)
+            $ circleOutline (fromIntegral t / 300 * 60 + 12)
+
+          if t >= 0
+            then livePieces . ix i . pieceTick -= 1
+            else do
+              livePieces . ix i . pieceTick += roleTicks role
+              forM_ cs $ \(j, k) -> do
+                when (i == j) $ livePieces . ix k %= activate f r
+                when (i == k) $ livePieces . ix j %= activate f r
         Nothing -> do
           color black $ circle 6
           p' <- mousePosition
           whenM mouseButtonL
-            $ when (norm p' < 12) $ livePieces . at i ?= Piece faction role
+            $ when (norm p' < 12) $ do
+              livePieces . at i
+                ?= Piece faction role (roleHealth role) (roleTicks role)
+              currentFaction %= cycleEnum
 
     tick
